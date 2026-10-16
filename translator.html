@@ -1,0 +1,165 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Live Translator</title>
+<style>
+  :root { color-scheme: light dark; --bg:#f6f5f2; --fg:#1c1c1a; --muted:#6b6a65; --card:#fff; --accent:#1f6feb; --stop:#d1344b; }
+  @media (prefers-color-scheme: dark) { :root { --bg:#141413; --fg:#f1f0ec; --muted:#9a998f; --card:#201f1d; --accent:#4c8dff; --stop:#ef5a70; } }
+  * { box-sizing: border-box; }
+  body { margin:0; background:var(--bg); color:var(--fg); font:16px/1.45 -apple-system, system-ui, sans-serif;
+         min-height:100dvh; display:flex; flex-direction:column; padding:max(16px, env(safe-area-inset-top)) 16px max(16px, env(safe-area-inset-bottom)); gap:14px; }
+  h1 { font-size:18px; margin:0; font-weight:600; }
+  .status { font-size:14px; color:var(--muted); font-weight:400; }
+  .card { background:var(--card); border-radius:14px; padding:14px 16px; }
+  .label { font-size:12px; text-transform:uppercase; letter-spacing:.06em; color:var(--muted); margin-bottom:6px; }
+  #target { font-size:22px; min-height:5.5em; max-height:40dvh; overflow-y:auto; }
+  #source { font-size:15px; color:var(--muted); min-height:3em; max-height:20dvh; overflow-y:auto; }
+  button { font:inherit; font-weight:600; border:0; border-radius:14px; padding:18px; width:100%; color:#fff; background:var(--accent); }
+  button.stop { background:var(--stop); }
+  button:disabled { opacity:.5; }
+  input, select { font:inherit; width:100%; padding:10px 12px; border-radius:10px; border:1px solid color-mix(in srgb, var(--muted) 40%, transparent); background:var(--card); color:var(--fg); }
+  details summary { color:var(--muted); font-size:14px; cursor:pointer; margin-bottom:8px; }
+  .row { display:flex; flex-direction:column; gap:8px; }
+  .spacer { flex:1; }
+</style>
+</head>
+<body>
+  <h1>Live Translator <span class="status" id="status">Ready</span></h1>
+
+  <div class="card">
+    <div class="label">Translation</div>
+    <div id="target"></div>
+  </div>
+  <div class="card">
+    <div class="label">Original</div>
+    <div id="source"></div>
+  </div>
+
+  <div class="spacer"></div>
+
+  <details id="settings">
+    <summary>Settings</summary>
+    <div class="row">
+      <input id="key" type="password" placeholder="OpenAI API key (stored only on this device)" autocomplete="off" autocapitalize="off" spellcheck="false">
+      <input id="lang" value="en" placeholder="Output language code (e.g. en)" autocomplete="off" autocapitalize="off">
+    </div>
+  </details>
+  <button id="btn">Start</button>
+
+<script>
+const $ = (id) => document.getElementById(id);
+const btn = $("btn"), statusEl = $("status"), targetEl = $("target"), sourceEl = $("source"),
+      keyEl = $("key"), langEl = $("lang"), settingsEl = $("settings");
+
+let pc = null, mic = null, wakeLock = null;
+
+try {
+  keyEl.value = localStorage.getItem("openai_key") || "";
+  langEl.value = localStorage.getItem("lang") || "en";
+} catch {}
+if (!keyEl.value) settingsEl.open = true;
+
+function setStatus(s) { statusEl.textContent = "· " + s; }
+
+// Try to mint a short-lived client secret first (safer: the long-lived key never goes
+// into the WebRTC call). If the browser can't reach that endpoint, fall back to the key itself.
+async function getCredential(apiKey, lang) {
+  try {
+    const r = await fetch("https://api.openai.com/v1/realtime/translations/client_secrets", {
+      method: "POST",
+      headers: { Authorization: `Bearer ${apiKey}`, "Content-Type": "application/json" },
+      body: JSON.stringify({ session: { model: "gpt-realtime-translate", audio: { output: { language: lang } } } }),
+    });
+    if (r.ok) {
+      const d = await r.json();
+      if (d.value) return { token: d.value, configured: true };
+    } else {
+      const t = await r.text();
+      if (r.status === 401) throw new Error("API key rejected (401)");
+      console.warn("client_secrets failed", r.status, t);
+    }
+  } catch (e) {
+    if (String(e.message).includes("401")) throw e;
+    console.warn("client_secrets unreachable, falling back to API key", e);
+  }
+  return { token: apiKey, configured: false };
+}
+
+async function start() {
+  const apiKey = keyEl.value.trim(), lang = (langEl.value.trim() || "en");
+  if (!apiKey) { settingsEl.open = true; setStatus("Add your API key"); return; }
+  try { localStorage.setItem("openai_key", apiKey); localStorage.setItem("lang", lang); } catch {}
+
+  btn.disabled = true;
+  setStatus("Connecting…");
+  targetEl.textContent = ""; sourceEl.textContent = "";
+
+  try {
+    const cred = await getCredential(apiKey, lang);
+
+    mic = await navigator.mediaDevices.getUserMedia({ audio: true });
+
+    pc = new RTCPeerConnection();
+    pc.addTrack(mic.getAudioTracks()[0], mic);
+
+    const out = new Audio();
+    out.autoplay = true;
+    out.playsInline = true;
+    pc.ontrack = ({ streams }) => { out.srcObject = streams[0]; };
+
+    const events = pc.createDataChannel("oai-events");
+    events.onopen = () => {
+      // If we had to fall back to the raw key, set the language over the data channel instead.
+      if (!cred.configured) {
+        events.send(JSON.stringify({ type: "session.update", session: { audio: { output: { language: lang } } } }));
+      }
+    };
+    events.onmessage = ({ data }) => {
+      let ev; try { ev = JSON.parse(data); } catch { return; }
+      if (ev.type === "session.output_transcript.delta") { targetEl.textContent += ev.delta; targetEl.scrollTop = targetEl.scrollHeight; }
+      else if (ev.type === "session.input_transcript.delta") { sourceEl.textContent += ev.delta; sourceEl.scrollTop = sourceEl.scrollHeight; }
+      else if (ev.type === "error") { setStatus("Error: " + (ev.error?.message || "see console")); console.error(ev); }
+    };
+
+    pc.onconnectionstatechange = () => {
+      if (!pc) return;
+      if (pc.connectionState === "connected") setStatus("Listening");
+      if (["failed", "disconnected", "closed"].includes(pc.connectionState)) { stop(); setStatus("Disconnected"); }
+    };
+
+    const offer = await pc.createOffer();
+    await pc.setLocalDescription(offer);
+
+    const sdpRes = await fetch("https://api.openai.com/v1/realtime/translations/calls", {
+      method: "POST",
+      headers: { Authorization: `Bearer ${cred.token}`, "Content-Type": "application/sdp" },
+      body: offer.sdp,
+    });
+    if (!sdpRes.ok) throw new Error(await sdpRes.text());
+    await pc.setRemoteDescription({ type: "answer", sdp: await sdpRes.text() });
+
+    try { wakeLock = await navigator.wakeLock?.request("screen"); } catch {}
+
+    btn.textContent = "Stop"; btn.classList.add("stop"); btn.disabled = false;
+  } catch (e) {
+    console.error(e);
+    setStatus("Failed: " + (e.message || e));
+    stop(true);
+  }
+}
+
+function stop(keepStatus) {
+  try { pc?.close(); } catch {}
+  try { mic?.getTracks().forEach((t) => t.stop()); } catch {}
+  try { wakeLock?.release(); } catch {}
+  pc = null; mic = null; wakeLock = null;
+  btn.textContent = "Start"; btn.classList.remove("stop"); btn.disabled = false;
+  if (!keepStatus) setStatus("Ready");
+}
+
+btn.addEventListener("click", () => (pc ? stop() : start()));
+</script>
+</body>
+</html>
